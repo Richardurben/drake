@@ -1,13 +1,11 @@
 #pragma once
 
-#include <iostream>
 #include <memory>
-#include <string>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
 #include "drake/common/drake_assert.h"
-#include "drake/common/eigen_types.h"
 #include "drake/common/text_logging.h"
 #include "drake/geometry/geometry_ids.h"
 #include "drake/geometry/geometry_roles.h"
@@ -21,23 +19,6 @@ namespace drake {
 namespace geometry {
 namespace internal {
 namespace hydroelastic {
-
-// TODO(SeanCurtis-TRI): Update this to have an additional classification: kBoth
-//  when we have the need from the algorithm. For example: when we have two
-//  very stiff objects, we'd want to process them as soft. But when one
-//  very stiff and one very soft object interact, it might make sense to
-//  consider the stiff object as effectively rigid and simplify the computation.
-//  In this case, the object would get two representations.
-/** Classification of the type of representation a shape has for the
- hydroelastic contact model: rigid or soft.  */
-enum class HydroelasticType {
-  kUndefined,
-  kRigid,
-  kSoft
-};
-
-/** Streaming operator for writing hydroelastic type to output stream.  */
-std::ostream& operator<<(std::ostream& out, const HydroelasticType& type);
 
 // TODO(SeanCurtis-TRI): When we do soft-soft contact, we'll need ∇p̃(e) as well.
 //  ∇p̃(e) is piecewise constant -- one ℜ³ vector per tetrahedron.
@@ -56,8 +37,8 @@ struct SoftMesh {
            std::unique_ptr<VolumeMeshField<double, double>> pressure_in)
       : mesh(std::move(mesh_in)),
         pressure(std::move(pressure_in)),
-        // TODO(tehbelinda): Create BVH once we start using it.
-        bvh(nullptr) {
+        bvh(std::make_unique<BoundingVolumeHierarchy<VolumeMesh<double>>>(
+            *mesh)) {
     DRAKE_ASSERT(mesh.get() == &pressure->mesh());
   }
 };
@@ -78,13 +59,16 @@ class SoftGeometry {
   SoftGeometry& operator=(SoftGeometry&&) = default;
 
   /** Returns a reference to the volume mesh.  */
-  const VolumeMesh<double>& mesh() const {
-    return *geometry_.mesh;
-  }
+  const VolumeMesh<double>& mesh() const { return *geometry_.mesh; }
 
   /** Returns a reference to the mesh's linearized pressure field.  */
   const VolumeMeshField<double, double>& pressure_field() const {
     return *geometry_.pressure;
+  }
+
+  /** Returns a reference to the bounding volume hierarchy.  */
+  const BoundingVolumeHierarchy<VolumeMesh<double>>& bvh() const {
+    return *geometry_.bvh;
   }
 
  private:
@@ -102,14 +86,21 @@ struct RigidMesh {
 
   explicit RigidMesh(std::unique_ptr<SurfaceMesh<double>> mesh_in)
       : mesh(std::move(mesh_in)),
-        // TODO(tehbelinda): Create BVH once we start using it.
-        bvh(nullptr) {}
+        bvh(std::make_unique<BoundingVolumeHierarchy<SurfaceMesh<double>>>(
+            *mesh)) {}
 };
 
-/** The base representation of rigid geometries. A rigid geometry is represented
- with a RigidMesh.  */
+/** The base representation of rigid geometries. Generally, a rigid geometry
+ is represented with a SurfaceMesh. However, half spaces do not get tessellated
+ and are treated as primitives. This class contains either representation.  */
 class RigidGeometry {
  public:
+  /** Constructs a rigid half space representation -- the half space, like its
+   specification HalfSpace, is defined in its canonical frame H with the
+   boundary plane at z = 0 and its outward normal pointing in the Hz direction.
+   */
+  RigidGeometry() = default;
+
   /** Constructs a rigid representation from the given surface mesh.  */
   explicit RigidGeometry(std::unique_ptr<SurfaceMesh<double>> mesh)
       : geometry_(RigidMesh(std::move(mesh))) {}
@@ -119,11 +110,32 @@ class RigidGeometry {
   RigidGeometry(RigidGeometry&&) = default;
   RigidGeometry& operator=(RigidGeometry&&) = default;
 
-  /** Returns a reference to the surface mesh.  */
-  const SurfaceMesh<double>& mesh() const { return *geometry_.mesh; }
+  /** Returns true if this RigidGeometry is a half space.  */
+  bool is_half_space() const { return !geometry_.has_value(); }
+
+  /** Returns a reference to the surface mesh -- calling this will throw unless
+   is_half_space() returns false.  */
+  const SurfaceMesh<double>& mesh() const {
+    if (is_half_space()) {
+      throw std::runtime_error(
+          "RigidGeometry::mesh() cannot be invoked for rigid half space");
+    }
+    return *(geometry_->mesh);
+  }
+
+  /** Returns a reference to the bounding volume hierarchy -- calling this will
+   throw unless is_half_space() returns false.  */
+  const BoundingVolumeHierarchy<SurfaceMesh<double>>& bvh() const {
+    if (is_half_space()) {
+      throw std::runtime_error(
+          "RigidGeometry::bvh() cannot be invoked for rigid half space");
+    }
+    return *(geometry_->bvh);
+  }
 
  private:
-  RigidMesh geometry_;
+  // If the mesh isn't defined, then this is implicitly a rigid half space.
+  std::optional<RigidMesh> geometry_{std::nullopt};
 };
 
 /** This class stores all instantiated hydroelastic representations of declared
@@ -233,24 +245,6 @@ class Geometries final : public ShapeReifier {
   std::unordered_map<GeometryId, RigidGeometry> rigid_geometries_;
 };
 
-/** Assesses the properties to determine *if* the geometry with the given
- `properties` requires a geometric representation and, if so, whether that
- representation is soft or rigid.
-
- The conditions are as follows:
-
-   - If `properties` does not have the group "hydroelastic", then it requires no
-     hydroelastic representation.
-   - Otherwise, its compliance is based on the (material, elastic modulus)
-     property. The disposition based on the property is:
-       - absent --> error
-       - infinity --> rigid
-       - greater than zero and less than infinity --> soft
-       - less than or equal to zero --> error
-
- @throws std::logic_error if any of the above error conditions are met.  */
-HydroelasticType Classify(const ProximityProperties& properties);
-
 /** @name Creating hydroelastic representations of shapes
 
  By default *no* shapes are supported with hydroelastic representations.
@@ -267,10 +261,10 @@ template <typename Shape>
 std::optional<RigidGeometry> MakeRigidRepresentation(
     const Shape& shape, const ProximityProperties&) {
   static const logging::Warn log_once(
-        "Rigid {} shapes are not currently supported for hydroelastic "
-        "contact; registration is allowed, but an error will be thrown "
-        "during contact.",
-        ShapeName(shape));
+      "Rigid {} shapes are not currently supported for hydroelastic "
+      "contact; registration is allowed, but an error will be thrown "
+      "during contact.",
+      ShapeName(shape));
   return {};
 }
 
@@ -294,15 +288,23 @@ std::optional<RigidGeometry> MakeRigidRepresentation(
 std::optional<RigidGeometry> MakeRigidRepresentation(
     const Ellipsoid& ellipsoid, const ProximityProperties& props);
 
+/** Rigid mesh support. It doesn't depend on any of the proximity properties. */
+std::optional<RigidGeometry> MakeRigidRepresentation(
+    const Mesh& mesh, const ProximityProperties& props);
+
+/** Rigid half space support.  */
+std::optional<RigidGeometry> MakeRigidRepresentation(
+    const HalfSpace& half_space, const ProximityProperties& props);
+
 /** Generic interface for handling unsupported soft Shapes. Unsupported
  geometries will return a std::nullopt.  */
 template <typename Shape>
-std::optional<SoftGeometry> MakeSoftRepresentation(
-    const Shape& shape, const ProximityProperties&) {
+std::optional<SoftGeometry> MakeSoftRepresentation(const Shape& shape,
+                                                   const ProximityProperties&) {
   static const logging::Warn log_once(
-        "Soft {} shapes are not currently supported for hydroelastic contact; "
-        "registration is allowed, but an error will be thrown during contact.",
-        ShapeName(shape));
+      "Soft {} shapes are not currently supported for hydroelastic contact; "
+      "registration is allowed, but an error will be thrown during contact.",
+      ShapeName(shape));
   return {};
 }
 

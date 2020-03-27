@@ -108,6 +108,7 @@ drake_cc_library(
 drake_cc_library(
     name = "geometric_transform",
     srcs = [
+        "hopf_coordinate.cc",
         "quaternion.cc",
         "random_rotation.cc",
         "rigid_transform.cc",
@@ -115,6 +116,7 @@ drake_cc_library(
         "rotation_matrix.cc",
     ],
     hdrs = [
+        "hopf_coordinate.h",
         "quaternion.h",
         "random_rotation.h",
         "rigid_transform.h",
@@ -232,6 +234,7 @@ drake_cc_library(
     srcs = ["quadratic_form.cc"],
     hdrs = ["quadratic_form.h"],
     deps = [
+        ":matrix_util",
         "//common:essential",
         "@eigen",
     ],
@@ -386,6 +389,13 @@ drake_cc_googletest(
     deps = [
         ":gray_code",
         "//common/test_utilities:eigen_matrix_compare",
+    ],
+)
+
+drake_cc_googletest(
+    name = "hopf_coordinate_test",
+    deps = [
+        ":geometric_transform",
     ],
 )
 

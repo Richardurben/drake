@@ -43,7 +43,7 @@ namespace multibody {
 /// Consider the following example to build a simple pendulum system:
 ///
 /// @code
-/// MultibodyPlant<double> plant;
+/// MultibodyPlant<double> plant(0.0);
 /// // ... Code here to setup quantities below as mass, com, etc. ...
 /// const Body<double>& pendulum =
 ///   plant.AddBody<RigidBody>(SpatialInertia<double>(mass, com, unit_inertia));
@@ -67,7 +67,7 @@ namespace multibody {
 /// on the stack; it will fail. Add joints to your plant using the provided API
 /// MultibodyPlant::AddJoint() as in the example above.
 ///
-/// @tparam T The scalar type. Must be a valid Eigen scalar.
+/// @tparam_default_scalar
 template <typename T>
 class Joint : public MultibodyElement<Joint, T, JointIndex>  {
  public:

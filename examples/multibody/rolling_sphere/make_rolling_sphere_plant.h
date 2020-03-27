@@ -21,14 +21,20 @@ namespace bouncing_ball {
 ///   The mass of the ball.
 /// @param[in] elastic_modulus
 ///   The modulus of elasticity for the ball. Only used when modeled with the
-///   hydroelastic model. See MultibodyPlant::set_elastic_modulus().
+///   hydroelastic model. See @ref mbp_hydroelastic_materials_properties
+///   "Hydroelastic contact" documentation for details.
 /// @param[in] dissipation
 ///   The Hunt & Crossley dissipation constant for the ball. Only used with the
-///   hydroelastic model. See MultibodyPlant::set_hunt_crossley_dissipation().
+///   hydroelastic model.  See @ref mbp_hydroelastic_materials_properties
+///   "Hydroelastic contact" documentation for details.
 /// @param[in] surface_friction
 ///   The Coulomb's law coefficients of friction.
 /// @param[in] gravity_W
 ///   The acceleration of gravity vector, expressed in the world frame W.
+/// @param[in] rigid_sphere
+///   If `true`, the sphere will have a _rigid_ hydroelastic representation;
+///   strict hydroelastic contact against the rigid ground will _not_ work. Use
+///   either point or hybrid contact models.
 /// @param scene_graph
 ///   If a SceneGraph is provided with this argument, this factory method
 ///   will register the new multibody plant to be a source for that geometry
@@ -41,7 +47,7 @@ MakeBouncingBallPlant(
     double radius, double mass,
     double elastic_modulus, double dissipation,
     const drake::multibody::CoulombFriction<double>& surface_friction,
-    const Vector3<double>& gravity_W,
+    const Vector3<double>& gravity_W, bool rigid_sphere,
     geometry::SceneGraph<double>* scene_graph = nullptr);
 
 }  // namespace bouncing_ball

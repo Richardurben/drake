@@ -19,7 +19,7 @@
 #include "drake/common/random.h"
 #include "drake/math/rigid_transform.h"
 #include "drake/multibody/tree/acceleration_kinematics_cache.h"
-#include "drake/multibody/tree/articulated_body_force_bias_cache.h"
+#include "drake/multibody/tree/articulated_body_force_cache.h"
 #include "drake/multibody/tree/articulated_body_inertia_cache.h"
 #include "drake/multibody/tree/multibody_forces.h"
 #include "drake/multibody/tree/multibody_tree_system.h"
@@ -72,16 +72,7 @@ template <typename T> class QuaternionFloatingMobilizer;
 /// Multibody dynamics elements include bodies, joints, force elements and
 /// constraints.
 ///
-/// @tparam T The scalar type. Must be a valid Eigen scalar.
-///
-/// Instantiated templates for the following kinds of T's are provided:
-///
-/// - double
-/// - AutoDiffXd
-/// - symbolic::Expression
-///
-/// They are already available to link against in the containing library.
-/// No other values for T are currently supported.
+/// @tparam_default_scalar
 template <typename T>
 class MultibodyTree {
  public:
@@ -675,6 +666,34 @@ class MultibodyTree {
   const Mobilizer<T>& get_mobilizer(MobilizerIndex mobilizer_index) const {
     DRAKE_THROW_UNLESS(mobilizer_index < num_mobilizers());
     return *owned_mobilizers_[mobilizer_index];
+  }
+
+  /// See MultibodyPlant method.
+  template <template <typename> class ForceElementType = ForceElement>
+  const ForceElementType<T>& GetForceElement(
+      ForceElementIndex force_element_index) const {
+    static_assert(
+        std::is_base_of<ForceElement<T>, ForceElementType<T>>::value,
+        "ForceElementType<T> must be a sub-class of ForceElement<T>.");
+    const ForceElement<T>* force_element =
+        &get_force_element(force_element_index);
+
+    const ForceElementType<T>* typed_force_element =
+        dynamic_cast<const ForceElementType<T>*>(force_element);
+    if (typed_force_element == nullptr) {
+      throw std::logic_error("ForceElement is not of type '" +
+                             NiceTypeName::Get<ForceElementType<T>>() +
+                             "' but of type '" +
+                             NiceTypeName::Get(*force_element) + "'.");
+    }
+
+    return *typed_force_element;
+  }
+
+  const ForceElement<T>& get_force_element(
+      ForceElementIndex force_element_index) const {
+    DRAKE_THROW_UNLESS(force_element_index < num_force_elements());
+    return *owned_force_elements_[force_element_index];
   }
 
   /// An accessor to the current gravity field.
@@ -1640,7 +1659,11 @@ class MultibodyTree {
 
   /// See MultibodyPlant method.
   void CalcMassMatrixViaInverseDynamics(
-      const systems::Context<T>& context, EigenPtr<MatrixX<T>> H) const;
+      const systems::Context<T>& context, EigenPtr<MatrixX<T>> M) const;
+
+  /// See MultibodyPlant method.
+  void CalcMassMatrix(const systems::Context<T>& context,
+                      EigenPtr<MatrixX<T>> M) const;
 
   /// See MultibodyPlant method.
   void CalcBiasTerm(
@@ -1671,13 +1694,13 @@ class MultibodyTree {
   1. CalcArticulatedBodyInertiaCache(): which performs a tip-to-base pass to
      compute the ArticulatedBodyInertia for each body along with other ABA
      quantities that are configuration dependent only.
-  2. CalcArticulatedBodyForceBiasCache(): a second tip-to-base pass which
+  2. CalcArticulatedBodyForceCache(): a second tip-to-base pass which
      essentially computes the bias terms in the ABA equations. These are a
      function of the full state x = [q; v] and externally applied actuation and
      forces.
   3. CalcArticulatedBodyAccelerations(): which performs a final base-to-tip
      recursion to compute the acceleration of each body in the model. These
-     accelerations are a function of the ArticulatedBodyForceBiasCache
+     accelerations are a function of the ArticulatedBodyForceCache
      previously computed by CalcArticulatedBodyForces(). That is, accelerations
      are a function of state x and applied forces.
 
@@ -1925,9 +1948,9 @@ class MultibodyTree {
   /// `x = [q; v]`, stored in `context`, and externally applied `forces`.
   /// Refer to @ref abi_and_bias_force "Articulated Body Inertia and Force Bias"
   /// for further details.
-  void CalcArticulatedBodyForceBiasCache(
+  void CalcArticulatedBodyForceCache(
       const systems::Context<T>& context, const MultibodyForces<T>& forces,
-      ArticulatedBodyForceBiasCache<T>* aba_force_bias_cache) const;
+      ArticulatedBodyForceCache<T>* aba_force_cache) const;
 
   /// Performs the final base-to-tip pass of ABA to compute the acceleration of
   /// each body in the model into output `ac`.
@@ -1935,8 +1958,28 @@ class MultibodyTree {
   /// further details.
   void CalcArticulatedBodyAccelerations(
     const systems::Context<T>& context,
-    const ArticulatedBodyForceBiasCache<T>& aba_force_bias_cache,
+    const ArticulatedBodyForceCache<T>& aba_force_cache,
     AccelerationKinematicsCache<T>* ac) const;
+
+  /// For a body B, computes the spatial acceleration bias term `Ab_WB` as it
+  /// appears in the acceleration level motion constraint imposed by body B's
+  /// mobilizer `A_WB = Aplus_WB + Ab_WB + H_PB_W * vdot_B`, with `Aplus_WB =
+  /// Φᵀ(p_PB) * A_WP` the rigidly shifted spatial acceleration of the inboard
+  /// body P and `H_PB_W` and `vdot_B` its mobilizer's hinge matrix and
+  /// mobilities, respectively. See @ref abi_computing_accelerations for further
+  /// details. On output `Ab_WB_cache[body_node_index]`
+  /// contains `Ab_WB` for the body with node index `body_node_index`.
+  void CalcSpatialAccelerationBiasCache(
+      const systems::Context<T>& context,
+      std::vector<SpatialAcceleration<T>>* Ab_WB_cache)
+      const;
+
+  /// Computes the articulated body force bias `Zb_Bo_W = Pplus_PB_W * Ab_WB`
+  /// for each articulated body B. On output `Zb_Bo_W_cache[body_node_index]`
+  /// contains `Zb_Bo_W` for the body B with node index `body_node_index`.
+  void CalcArticulatedBodyForceBiasCache(
+      const systems::Context<T>& context,
+      std::vector<SpatialForce<T>>* Zb_Bo_W_cache) const;
 
   /// @}
 
@@ -2480,6 +2523,20 @@ class MultibodyTree {
       const systems::Context<T>& context) const {
     DRAKE_ASSERT(tree_system_ != nullptr);
     return tree_system_->EvalDynamicBiasCache(context);
+  }
+
+  // See CalcSpatialAccelerationBiasCache() for details.
+  const std::vector<SpatialAcceleration<T>>& EvalSpatialAccelerationBiasCache(
+      const systems::Context<T>& context) const {
+    DRAKE_ASSERT(tree_system_ != nullptr);
+    return tree_system_->EvalSpatialAccelerationBiasCache(context);
+  }
+
+  // See CalcArticulatedBodyForceBiasCache() for details.
+  const std::vector<SpatialForce<T>>& EvalArticulatedBodyVelocityBiasCache(
+      const systems::Context<T>& context) const {
+    DRAKE_ASSERT(tree_system_ != nullptr);
+    return tree_system_->EvalArticulatedBodyVelocityBiasCache(context);
   }
 
   // Given the state of this model in `context` and a known vector

@@ -1,7 +1,6 @@
 #include "drake/geometry/proximity/hydroelastic_internal.h"
 
-#include <limits>
-#include <vector>
+#include <string>
 
 #include <fmt/format.h>
 
@@ -13,6 +12,7 @@
 #include "drake/geometry/proximity/make_ellipsoid_mesh.h"
 #include "drake/geometry/proximity/make_sphere_field.h"
 #include "drake/geometry/proximity/make_sphere_mesh.h"
+#include "drake/geometry/proximity/obj_to_surface_mesh.h"
 #include "drake/geometry/proximity/volume_to_surface_mesh.h"
 
 namespace drake {
@@ -20,27 +20,8 @@ namespace geometry {
 namespace internal {
 namespace hydroelastic {
 
-using Eigen::Vector3d;
 using std::make_unique;
 using std::move;
-using std::vector;
-
-std::ostream& operator<<(std::ostream& out, const HydroelasticType& type) {
-  switch (type) {
-    case HydroelasticType::kUndefined:
-      out << "undefined";
-      break;
-    case HydroelasticType::kRigid:
-      out << "rigid";
-      break;
-    case HydroelasticType::kSoft:
-      out << "soft";
-      break;
-    default:
-      DRAKE_UNREACHABLE();
-  }
-  return out;
-}
 
 SoftGeometry& SoftGeometry::operator=(const SoftGeometry& g) {
   if (this == &g) return *this;
@@ -57,8 +38,10 @@ SoftGeometry& SoftGeometry::operator=(const SoftGeometry& g) {
 RigidGeometry& RigidGeometry::operator=(const RigidGeometry& g) {
   if (this == &g) return *this;
 
-  auto mesh = make_unique<SurfaceMesh<double>>(g.mesh());
-  geometry_ = RigidMesh(move(mesh));
+  geometry_ = std::nullopt;
+  if (!g.is_half_space()) {
+    geometry_ = RigidMesh(make_unique<SurfaceMesh<double>>(g.mesh()));
+  }
 
   return *this;
 }
@@ -77,7 +60,8 @@ void Geometries::RemoveGeometry(GeometryId id) {
 
 void Geometries::MaybeAddGeometry(const Shape& shape, GeometryId id,
                                   const ProximityProperties& properties) {
-  const HydroelasticType type = Classify(properties);
+  const HydroelasticType type = properties.GetPropertyOrDefault(
+      kHydroGroup, kComplianceType, HydroelasticType::kUndefined);
   if (type != HydroelasticType::kUndefined) {
     ReifyData data{type, id, properties};
     shape.Reify(this, &data);
@@ -147,32 +131,6 @@ void Geometries::AddGeometry(GeometryId id, RigidGeometry geometry) {
   rigid_geometries_.insert({id, move(geometry)});
 }
 
-HydroelasticType Classify(const ProximityProperties& props) {
-  // Presence of the hydroelastic group triggers an attempt to represent it.
-  if (props.HasGroup(kHydroGroup)) {
-    if (props.HasProperty(kMaterialGroup, kElastic)) {
-      const double elastic_modulus =
-          props.GetProperty<double>(kMaterialGroup, kElastic);
-      if (std::isinf(elastic_modulus)) {
-        return HydroelasticType::kRigid;
-      } else if (elastic_modulus <= 0) {
-        throw std::logic_error(
-            fmt::format("Properties contain a bad value for the ('{}', '{}') "
-                        "property: {}; the value must be positive",
-                        kMaterialGroup, kElastic, elastic_modulus));
-      } else {
-        return HydroelasticType::kSoft;
-      }
-    } else {
-      throw std::logic_error(
-          fmt::format("Properties contain the '{}' group but is missing the "
-                      "('{}', '{}') property; compliance cannot be determined",
-                      kHydroGroup, kMaterialGroup, kElastic));
-    }
-  }
-  return HydroelasticType::kUndefined;
-}
-
 // Validator interface for use with extracting valid properties. It is
 // instantiated with shape (e.g., "Sphere", "Box", etc.) and compliance (i.e.,
 // "rigid" or "soft") strings (to help give intelligible error messages) and
@@ -237,6 +195,12 @@ class PositiveDouble : public Validator<double> {
 };
 
 std::optional<RigidGeometry> MakeRigidRepresentation(
+    const HalfSpace&, const ProximityProperties&) {
+  // Default constructor creates a rigid half space.
+  return RigidGeometry();
+}
+
+std::optional<RigidGeometry> MakeRigidRepresentation(
     const Sphere& sphere, const ProximityProperties& props) {
   PositiveDouble validator("Sphere", "rigid");
   const double edge_length = validator.Extract(props, kHydroGroup, kRezHint);
@@ -272,6 +236,15 @@ std::optional<RigidGeometry> MakeRigidRepresentation(
   const double edge_length = validator.Extract(props, kHydroGroup, kRezHint);
   auto mesh = make_unique<SurfaceMesh<double>>(
       MakeEllipsoidSurfaceMesh<double>(ellipsoid, edge_length));
+
+  return RigidGeometry(move(mesh));
+}
+
+std::optional<RigidGeometry> MakeRigidRepresentation(
+    const Mesh& mesh_spec, const ProximityProperties&) {
+  // Mesh does not use any properties.
+  auto mesh = make_unique<SurfaceMesh<double>>(
+      ReadObjToSurfaceMesh(mesh_spec.filename(), mesh_spec.scale()));
 
   return RigidGeometry(move(mesh));
 }

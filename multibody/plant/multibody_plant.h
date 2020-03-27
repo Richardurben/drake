@@ -36,6 +36,17 @@
 
 namespace drake {
 namespace multibody {
+namespace internal {
+
+// Data stored in the cache entry for the hydroelastic with fallback contact
+// model.
+template <typename T>
+struct HydroelasticFallbackCacheData {
+  std::vector<geometry::ContactSurface<T>> contact_surfaces;
+  std::vector<geometry::PenetrationAsPointPair<T>> point_pairs;
+};
+
+}  // namespace internal
 
 // TODO(amcastro-tri): Add a section on contact models in
 // contact_model_doxygen.h.
@@ -47,7 +58,14 @@ enum class ContactModel {
 
   /// Contact forces are computed using a point contact model, see @ref
   /// point_contact_approximation "Numerical Approximation of Point Contact".
-  kPointContactOnly
+  kPointContactOnly,
+
+  /// Contact forces are computed using the hydroelastic model, where possible.
+  /// For most other unsupported colliding pairs, the point model from
+  /// kPointContactOnly is used. See
+  /// geometry::QueryObject:ComputeContactSurfacesWithFallback for more
+  /// details.
+  kHydroelasticWithFallback
 };
 
 /// @cond
@@ -213,6 +231,50 @@ enum class ContactModel {
 /// each `<model>` tag found in the file. Please refer to each of these
 /// methods' documentation for further details.
 ///
+/// @anchor add_multibody_plant_scene_graph
+///   ### Adding a %MultibodyPlant connected to a %SceneGraph to your %Diagram
+///
+/// Probably the simplest way to add and wire up a MultibodyPlant with
+/// a SceneGraph in your Diagram is using AddMultibodyPlantSceneGraph().
+///
+/// Recommended usages:
+///
+/// Assign to a MultibodyPlant reference (ignoring the SceneGraph):
+/// @code
+///   MultibodyPlant<double>& plant =
+///       AddMultibodyPlantSceneGraph(&builder, 0.0 /* time_step */);
+///   plant.DoFoo(...);
+/// @endcode
+/// This flavor is the simplest, when the SceneGraph is not explicitly needed.
+/// (It can always be retrieved later via GetSubsystemByName("scene_graph").)
+///
+/// Assign to auto, and use the named public fields:
+/// @code
+///   auto items = AddMultibodyPlantSceneGraph(&builder, 0.0 /* time_step */);
+///   items.plant.DoFoo(...);
+///   items.scene_graph.DoBar(...);
+/// @endcode
+/// or taking advantage of C++17's structured binding
+/// @code
+///   auto [plant, scene_graph] = AddMultibodyPlantSceneGraph(&builder);
+///   ...
+///   plant.DoFoo(...);
+///   scene_graph.DoBar(...);
+/// @endcode
+/// This is the easiest way to use both the plant and scene_graph.
+///
+/// Assign to already-declared pointer variables:
+/// @code
+///   MultibodyPlant<double>* plant{};
+///   SceneGraph<double>* scene_graph{};
+///   std::tie(plant, scene_graph) =
+///       AddMultibodyPlantSceneGraph(&builder, 0.0 /* time_step */);
+///   plant->DoFoo(...);
+///   scene_graph->DoBar(...);
+/// @endcode
+/// This flavor is most useful when the pointers are class member fields
+/// (and so perhaps cannot be references).
+///
 /// @anchor mbp_adding_elements
 ///                    ### Adding modeling elements
 ///
@@ -302,8 +364,7 @@ enum class ContactModel {
 ///     Minimal formulation of joint motion for biomechanisms.
 ///     Nonlinear dynamics, 62(1), pp.291-303.
 ///
-/// @tparam T Must be one of drake's default scalar types.
-///
+/// @tparam_default_scalar
 /// @ingroup systems
 template <typename T>
 class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
@@ -368,8 +429,8 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   /// SceneGraph.
   const systems::InputPort<T>& get_geometry_query_input_port() const;
 
-  /// Returns a constant reference to the output port for the full state
-  /// x = [q v] of the model.
+  /// Returns a constant reference to the output port for the multibody state
+  /// x = [q, v] of the model.
   /// @pre Finalize() was already called on `this` plant.
   /// @throws std::exception if called before Finalize().
   const systems::OutputPort<T>& get_state_output_port() const;
@@ -447,22 +508,64 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   /// Once _all_ modeling elements have been added, the Finalize() method
   /// **must** be called. A call to any construction method **after** a call to
   /// Finalize() causes an exception to be thrown.
-  //  After calling Finalize(), you may invoke %MultibodyPlant
+  ///  After calling Finalize(), you may invoke %MultibodyPlant
   /// methods that perform computations. See Finalize() for details.
   /// @{
 
-  /// Default constructor creates a plant with a single "world" body.
+  /// Default constructor creates a plant modeled as a continuous system.
+  /// Please refer to MultibodyPlant(double) for details.
+  DRAKE_DEPRECATED("2020-05-01",
+                   "Use MultibodyPlant(double) with time_step = 0.")
+  MultibodyPlant() : MultibodyPlant(0.0) {}
+
+  /// This constructor creates a plant with a single "world" body.
   /// Therefore, right after creation, num_bodies() returns one.
+  ///
+  /// %MultibodyPlant offers two different modalities to model mechanical sytems
+  /// in time. These are:
+  ///  1. As a discrete system with periodic updates, `time_step` is strictly
+  ///     greater than zero.
+  ///  2. As a continuous system, `time_step` equals exactly zero.
+  ///
+  /// Currently the discrete model is preferred for simulation given its
+  /// robustness and speed in problems with frictional contact. However this
+  /// might change as we work towards developing better strategies to model
+  /// contact.
+  /// See @ref time_advancement_strategy
+  /// "Choice of Time Advancement Strategy" for further details.
+  ///
+  /// @warning Users should be aware of current limitations in either modeling
+  /// modality. While the discrete model is often the preferred option for
+  /// problems with frictional contact given its robustness and speed, it might
+  /// become unstable when using large feedback gains, high damping or large
+  /// external forcing. %MultibodyPlant will throw an exception whenever the
+  /// discrete solver is detected to fail.
+  /// Conversely, the continuous modality has the potential to leverage the
+  /// robustness and accuracy control provide by Drake's integrators. However
+  /// thus far this has proved difficult in practice and especially due to poor
+  /// performance.
+  ///
+  /// <!-- TODO(amcastro-tri): Update the @warning messages in these docs if the
+  ///      best practices advice changes as our solvers evolve. -->
+  ///
   /// @param[in] time_step
-  ///   An optional parameter indicating whether `this` plant is modeled as a
-  ///   continuous system (`time_step = 0`) or as a discrete system with
-  ///   periodic updates of period `time_step > 0`. @default 0.0.
+  ///   Indicates whether `this` plant is modeled as a continuous system
+  ///   (`time_step = 0`) or as a discrete system with periodic updates of
+  ///   period `time_step > 0`. See @ref time_advancement_strategy
+  ///   "Choice of Time Advancement Strategy" for further details.
+  ///
+  /// @warning Currently the continuous modality with `time_step = 0` does not
+  /// support joint limits for simulation, these are ignored. %MultibodyPlant
+  /// prints a warning to console if joint limits are provided. If your
+  /// simulation requires joint limits currently you must use a discrete
+  /// %MultibodyPlant model.
+  ///
   /// @throws std::exception if `time_step` is negative.
-  explicit MultibodyPlant(double time_step = 0);
+  explicit MultibodyPlant(double time_step);
 
   /// Scalar-converting copy constructor.  See @ref system_scalar_conversion.
   template <typename U>
-  MultibodyPlant(const MultibodyPlant<U>& other)
+  explicit MultibodyPlant(const MultibodyPlant<U>& other)
       : internal::MultibodyTreeSystem<T>(
             systems::SystemTypeTag<MultibodyPlant>{},
             other.internal_tree().template CloneToScalar<T>(),
@@ -535,6 +638,7 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
     collision_geometries_.emplace_back();
     DRAKE_DEMAND(X_WB_default_list_.size() == body.index());
     X_WB_default_list_.emplace_back();
+    RegisterRigidBodyWithSceneGraph(body);
     return body;
   }
 
@@ -956,10 +1060,19 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   /// @param[in] shape
   ///   The geometry::Shape used for visualization. E.g.: geometry::Sphere,
   ///   geometry::Cylinder, etc.
-  /// @param[in] coulomb_friction
-  ///   Coulomb's law of friction coefficients to model friction on the
-  ///   surface of `shape` for the given `body`.
-  /// @throws std::exception if called post-finalize.
+  /// @param[in] properties
+  ///   The proximity properties associated with the collision geometry. They
+  ///   *must* include the (`material`, `coulomb_friction`) property of type
+  ///   CoulombFriction<double>.
+  /// @throws std::exception if called post-finalize or if the properties are
+  /// missing the coulomb friction property (or if it is of the wrong type).
+  geometry::GeometryId RegisterCollisionGeometry(
+      const Body<T>& body, const math::RigidTransform<double>& X_BG,
+      const geometry::Shape& shape, const std::string& name,
+      geometry::ProximityProperties properties);
+
+  // TODO(SeanCurtis-TRI): Deprecate this in favor of simply passing properties.
+  /// Overload which specifies a single property: coulomb_friction.
   geometry::GeometryId RegisterCollisionGeometry(
       const Body<T>& body, const math::RigidTransform<double>& X_BG,
       const geometry::Shape& shape, const std::string& name,
@@ -973,6 +1086,16 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   /// @see RegisterCollisionGeometry(), Finalize()
   const std::vector<geometry::GeometryId>& GetCollisionGeometriesForBody(
       const Body<T>& body) const;
+
+  /// Excludes the collision geometries between two given collision filter
+  /// groups.
+  /// @pre RegisterAsSourceForSceneGraph() has been called.
+  /// @pre Finalize() has *not* been called.
+  void ExcludeCollisionGeometriesWithCollisionFilterGroupPair(
+      const std::pair<std::string, geometry::GeometrySet>&
+          collision_filter_group_a,
+      const std::pair<std::string, geometry::GeometrySet>&
+          collision_filter_group_b);
 
   /// For each of the provided `bodies`, collects up all geometries that have
   /// been registered to that body. Intended to be used in conjunction with
@@ -1011,7 +1134,7 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
     return &internal_tree().get_body(it->second);
   }
 
-  /// If the body with `body_index` has geometry registered with it, it returns
+  /// If the body with `body_index` belongs to the called plant, it returns
   /// the geometry::FrameId associated with it. Otherwise, it returns nullopt.
   std::optional<geometry::FrameId> GetBodyFrameIdIfExists(
       BodyIndex body_index) const {
@@ -1022,10 +1145,10 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
     return it->second;
   }
 
-  /// If the body with `body_index` has geometry registered with it, it returns
+  /// If the body with `body_index` belongs to the called plant, it returns
   /// the geometry::FrameId associated with it. Otherwise this method throws
   /// an exception.
-  /// @throws std::exception if no geometry has been registered with the body
+  /// @throws std::exception if the called plant does not have the body
   /// indicated by `body_index`.
   geometry::FrameId GetBodyFrameIdOrThrow(BodyIndex body_index) const {
     const auto it = body_index_to_frame_id_.find(body_index);
@@ -1063,14 +1186,32 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   /// The effective modulus of elasticity is computed in accordance with the
   /// Hertz theory of contact. Dissipation is weighted in accordance with the
   /// fact that the softer material will deform more and faster and thus the
-  /// softer material dissipation is given more importance.
-  /// The elastic modulus and dissipation can be specified with
-  /// set_elastic_modulus() and set_hunt_crossley_dissipation()
-  /// respectively. Elastic modulus has units of pressure, i.e. `Pa (N/m²)`. We
-  /// use a dissipation model inspired by the model in [Hunt and Crossley,
-  /// 1975], parameterized by a dissipation constant with units of inverse of
-  /// velocity, i.e. `s/m`. With the effective properties of the pair defined as
-  /// above, the hydroelastic model pressure field is computed according to:
+  /// softer material dissipation is given more importance. Elastic modulus has
+  /// units of pressure, i.e. `Pa (N/m²)`. The elastic modulus is often
+  /// estimated based on the Young's modulus of the material though in the
+  /// hydroelastic model it represents an effective elastic property. For
+  /// instance, [R. Elandt 2019] chooses to use `E = G`, with `G` the P-wave
+  /// elastic modulus `G = (1-ν)/(1+ν)/(1-2ν)E`, with ν the Poisson
+  /// ratio, consistent with the theory of layered solids in which plane
+  /// sections remain planar after compression. Another possibility is to
+  /// specify `E = E*`, with `E*` the effective elastic modulus given by the
+  /// Hertz theory of contact, `E* = E/(1-ν²)`. In all of these cases a sound
+  /// estimation of `elastic_modulus` starts with the Young's modulus of the
+  /// material.
+  ///
+  /// We use a dissipation model inspired by the model in
+  /// [Hunt and Crossley, 1975], parameterized by a dissipation constant with
+  /// units of inverse of velocity, i.e. `s/m`.
+  ///
+  /// The elastic modulus and dissipation can be specified in one of two ways:
+  ///
+  /// - define them in an instance of geometry::ProximityProperties using
+  ///   the function geometry::AddContactMaterial(), or
+  /// - define them in an input URDF/SDF as detailed @ref sdf_contact_material
+  ///   "here for SDF" or @ref urdf_contact_material "here for URDF".
+  ///
+  /// With the effective properties of the pair defined as above, the
+  /// hydroelastic model pressure field is computed according to:
   /// <pre>
   ///   p(x) = E⋅ε(x)⋅(1 - d⋅vₙ(x))₊
   /// </pre>
@@ -1184,65 +1325,6 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   /// The default contact model is ContactModel::kPointContactOnly.
   /// @throws std::exception iff called post-finalize.
   void set_contact_model(ContactModel model);
-
-  /// Specifies the `elastic_modulus` E for a geometry identified by its `id`.
-  /// `elastic_modulus` must be specified with units of Pa (N/m²). The elastic
-  /// modulus is often estimated based on the Young's modulus of the material
-  /// though in the hydroelastic model it represents an effective elastic
-  /// property. For instance, [R. Elandt 2019] chooses to use `E = G`, with `G`
-  /// the P-wave elastic modulus `G = (1-ν)/(1+ν)/(1-2ν)E`, with ν the Poisson
-  /// ratio, consistent with the theory of layered solids in which plane
-  /// sections remain planar after compression. Another possibly is to specify
-  /// `E = E*`, with `E*` the effective elastic modulus given by the Hertz
-  /// theory of contact, `E* = E/(1-ν²)`. In all of these cases a sound
-  /// estimation of `elastic_modulus` starts with the Young's modulus of the
-  /// material. See
-  /// @ref mbp_hydroelastic_materials_properties "Hydroelastic model material
-  /// properties" for further details. By default geometries are assumed to be
-  /// rigid, i.e. with an infinite `elastic_modulus`.
-  ///
-  /// @throws std::exception if `elastic_modulus` is negative or zero.
-  /// @throws std::exception if `id` does not correspond to a collision
-  /// geometry previously registered with this model.
-  /// @throws std::exception if called post-finalize.
-  void set_elastic_modulus(geometry::GeometryId id, double elastic_modulus) {
-    // It must not be finalized so that member_scene_graph() is valid.
-    DRAKE_MBP_THROW_IF_FINALIZED();
-    DRAKE_THROW_UNLESS(is_collision_geometry(id));
-    DRAKE_THROW_UNLESS(elastic_modulus > 0);
-    const geometry::ProximityProperties* old_props =
-        member_scene_graph().model_inspector().GetProximityProperties(id);
-    DRAKE_DEMAND(old_props);
-    geometry::ProximityProperties new_props(*old_props);
-    new_props.AddProperty("material", "elastic_modulus", elastic_modulus);
-    member_scene_graph().AssignRole(*get_source_id(), id, new_props,
-                                    geometry::RoleAssign::kReplace);
-  }
-
-  /// Specifies the Hunt & Crossley dissipation coefficient for the
-  /// hydroelastic model. It has units of `s/m`, inverse of velocity.
-  /// See @ref mbp_hydroelastic_materials_properties "Hydroelastic model
-  /// material properties" for further details.
-  /// By default dissipation is zero.
-  ///
-  /// @throws std::exception if `dissipation` is negative (it can be zero).
-  /// @throws std::exception if `id` does not correspond to a collision
-  /// geometry previously registered with this model.
-  /// @throws std::exception if called post-finalize.
-  void set_hunt_crossley_dissipation(geometry::GeometryId id,
-                                     double dissipation) {
-    // It must not be finalized so that member_scene_graph() is valid.
-    DRAKE_MBP_THROW_IF_FINALIZED();
-    DRAKE_DEMAND(is_collision_geometry(id));
-    DRAKE_THROW_UNLESS(dissipation >= 0);
-    const geometry::ProximityProperties* old_props =
-        member_scene_graph().model_inspector().GetProximityProperties(id);
-    DRAKE_DEMAND(old_props);
-    geometry::ProximityProperties new_props(*old_props);
-    new_props.AddProperty("material", "hunt_crossley_dissipation", dissipation);
-    member_scene_graph().AssignRole(*get_source_id(), id, new_props,
-                                    geometry::RoleAssign::kReplace);
-  }
 
   /// Sets the penetration allowance used to estimate the coefficients in the
   /// penalty method used to impose non-penetration among bodies. Refer to the
@@ -1917,9 +1999,23 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   const std::vector<geometry::PenetrationAsPointPair<T>>&
   EvalPointPairPenetrations(const systems::Context<T>& context) const {
     DRAKE_MBP_THROW_IF_NOT_FINALIZED();
-    return this->get_cache_entry(cache_indexes_.point_pairs)
-        .template Eval<std::vector<geometry::PenetrationAsPointPair<T>>>(
+    switch (contact_model_) {
+      case ContactModel::kPointContactOnly:
+        return this->get_cache_entry(cache_indexes_.point_pairs)
+            .template Eval<std::vector<geometry::PenetrationAsPointPair<T>>>(
             context);
+      case ContactModel::kHydroelasticWithFallback: {
+        const auto& data =
+            this->get_cache_entry(cache_indexes_.hydro_fallback)
+                .template Eval<internal::HydroelasticFallbackCacheData<T>>(
+                    context);
+        return data.point_pairs;
+      }
+      default:
+        throw std::logic_error(
+            "Attempting to evaluate point pair contact for contact model that "
+            "doesn't use it");
+    }
   }
 
   /// Calculates the rigid transform (pose) `X_FG` relating frame F and frame G.
@@ -2251,9 +2347,12 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   /// inverse dynamics, where the generalized positions q are stored in
   /// `context`. See CalcInverseDynamics().
   ///
+  /// Use CalcMassMatrix() for a faster implementation using the Composite Body
+  /// Algorithm.
+  ///
   /// @param[in] context
   ///   The context containing the state of the model.
-  /// @param[out] H
+  /// @param[out] M
   ///   A valid (non-null) pointer to a squared matrix in `ℛⁿˣⁿ` with n the
   ///   number of generalized velocities (num_velocities()) of the model.
   ///   This method aborts if H is nullptr or if it does not have the proper
@@ -2270,16 +2369,36 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   /// dynamics with an acceleration vector `v̇ = eᵢ`, with `eᵢ` the standard
   /// (or natural) basis of `ℛⁿ` with n the number of generalized velocities.
   /// We write this as: <pre>
-  ///   H.ᵢ(q) = M(q) * e_i
+  ///   M.ᵢ(q) = M(q) * e_i
   /// </pre>
-  /// where `H.ᵢ(q)` (notice the dot for the rows index) denotes the `i-th`
+  /// where `M.ᵢ(q)` (notice the dot for the rows index) denotes the `i-th`
   /// column in M(q).
   ///
   /// @warning This is an O(n²) algorithm. Avoid the explicit computation of the
   /// mass matrix whenever possible.
   void CalcMassMatrixViaInverseDynamics(
-      const systems::Context<T>& context, EigenPtr<MatrixX<T>> H) const {
-    internal_tree().CalcMassMatrixViaInverseDynamics(context, H);
+      const systems::Context<T>& context, EigenPtr<MatrixX<T>> M) const {
+    internal_tree().CalcMassMatrixViaInverseDynamics(context, M);
+  }
+
+  /// Performs the computation of the mass matrix `M(q)` of the model, as a
+  /// function of the generalized positions q stored in `context`.
+  /// This method employs the Composite Body Algorithm, which is known to be the
+  /// fastest O(n²) algorithm to compute the mass matrix of a multibody system.
+  ///
+  /// @param[in] context
+  ///   The context containing the state of the model.
+  /// @param[out] M
+  ///   A valid (non-null) pointer to a squared matrix in `ℛⁿˣⁿ` with n the
+  ///   number of generalized velocities (num_velocities()) of the model.
+  ///   This method aborts if M is nullptr or if it does not have the proper
+  ///   size.
+  ///
+  /// @warning This is an O(n²) algorithm. Avoid the explicit computation of the
+  /// mass matrix whenever possible.
+  void CalcMassMatrix(const systems::Context<T>& context,
+                      EigenPtr<MatrixX<T>> M) const {
+    internal_tree().CalcMassMatrix(context, M);
   }
 
   /// Computes the bias term `C(q, v)v` containing Coriolis, centripetal, and
@@ -2999,6 +3118,30 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
     return internal_tree().num_force_elements();
   }
 
+  /// Returns a constant reference to the force element with unique index
+  /// `force_element_index`.
+  /// @throws std::runtime_error when `force_element_index` does not correspond
+  /// to a force element in this model.
+  const ForceElement<T>& get_force_element(
+      ForceElementIndex force_element_index) const {
+    return internal_tree().get_force_element(force_element_index);
+  }
+
+  /// Returns a constant reference to a force element identified by its unique
+  /// index in `this` %MultibodyPlant.  If the optional template argument is
+  /// supplied, then the returned value is downcast to the specified
+  /// `ForceElementType`.
+  /// @tparam ForceElementType The specific type of the ForceElement to be
+  /// retrieved. It must be a subclass of ForceElement.
+  /// @throws std::logic_error if the force element is not of type
+  /// `ForceElementType` or if there is no ForceElement with that index.
+  template <template <typename> class ForceElementType = ForceElement>
+  const ForceElementType<T>& GetForceElement(
+      ForceElementIndex force_element_index) const {
+    return internal_tree().template GetForceElement<ForceElementType>(
+        force_element_index);
+  }
+
   /// An accessor to the current gravity field.
   const UniformGravityFieldElement<T>& gravity_field() const {
     return internal_tree().gravity_field();
@@ -3037,6 +3180,13 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   ModelInstanceIndex GetModelInstanceByName(const std::string& name) const {
     return internal_tree().GetModelInstanceByName(name);
   }
+
+  /// Returns a Graphviz string describing the topology of this plant.
+  /// To render the string, use the Graphviz tool, ``dot``.
+  /// http://www.graphviz.org/
+  ///
+  /// Note: this method can be called either before or after `Finalize()`.
+  std::string GetTopologyGraphvizString() const;
 
   /// Returns the size of the generalized position vector q for this model.
   int num_positions() const { return internal_tree().num_positions(); }
@@ -3183,56 +3333,6 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   }
   /// @} <!-- Introspection -->
 
-  /// @name                  Deprecated methods
-  /// Don't use these -- use the specified replacement instead.
-  /// @{
-
-  /// For a point Fp fixed/welded to a frame F, calculates `Jv_V_WFp`, Fp's
-  /// spatial velocity Jacobian with respect to generalized velocities v.
-  /// @param[in] context
-  ///   The context containing the state of the model. It stores the
-  ///   generalized positions q.
-  /// @param[in] frame_F
-  ///   The position vector `p_FoFp` is expressed in this frame F.
-  /// @param[in] p_FoFp
-  ///   The position vector from Fo (frame F's origin) to Fp, expressed in F.
-  /// @param[out] Jv_V_WFp
-  ///   Fp's spatial velocity Jacobian with respect to generalized velocities v.
-  ///   `V_WFp`, Fp's spatial velocity in world frame W, can be written <pre>
-  ///   V_WFp(q, v) = Jv_V_WFp(q) * v
-  /// </pre>
-  ///   The Jacobian `Jv_V_WFp(q)` is a matrix of size `6 x nv`, with `nv`
-  ///   the number of generalized velocities. On input, matrix `Jv_WFp` **must**
-  ///   have size `6 x nv` or this method throws an exception. The top rows of
-  ///   this matrix (which can be accessed with Jv_WFp.topRows<3>()) is the
-  ///   Jacobian `Hw_WFp` related to the angular velocity of `Fp` in W by
-  ///   `w_WFp = Hw_WFp⋅v`. The bottom rows of this matrix (which can be
-  ///   accessed with Jv_WFp.bottomRows<3>()) is the Jacobian `Hv_WFp` related
-  ///   to the translational velocity of the origin `P` of frame `Fp` in W by
-  ///   `v_WFpo = Hv_WFp⋅v`. This ordering is consistent with the internal
-  ///   storage of the SpatialVelocity class. Therefore the following operations
-  ///   results in a valid spatial velocity: <pre>
-  ///     SpatialVelocity<double> Jv_WFp_times_v(Jv_WFp * v);
-  ///   </pre>
-  /// @throws std::exception if `J_WFp` is nullptr or if it is not of size
-  ///   `6 x nv`.
-  DRAKE_DEPRECATED("2020-02-01", "Use CalcJacobianSpatialVelocity().")
-  void CalcFrameGeometricJacobianExpressedInWorld(
-      const systems::Context<T>& context,
-      const Frame<T>& frame_F,
-      const Eigen::Ref<const Vector3<T>>& p_FP,
-      EigenPtr<MatrixX<T>> J_WFp) const {
-    const Frame<T>& frame_W = world_frame();
-    return CalcJacobianSpatialVelocity(context,
-                                       JacobianWrtVariable::kV,
-                                       frame_F,
-                                       p_FP,
-                                       frame_W,
-                                       frame_W,
-                                       J_WFp);
-  }
-  /// @} <!-- Deprecated methods -->
-
   using internal::MultibodyTreeSystem<T>::is_discrete;
   using internal::MultibodyTreeSystem<T>::EvalPositionKinematics;
   using internal::MultibodyTreeSystem<T>::EvalVelocityKinematics;
@@ -3268,13 +3368,14 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   // when the plant declares its cache entries.
   struct CacheIndexes {
     systems::CacheIndex aba_accelerations;
-    systems::CacheIndex aba_force_bias_cache;
+    systems::CacheIndex aba_force_cache;
     systems::CacheIndex contact_info_and_body_spatial_forces;
     systems::CacheIndex contact_jacobians;
     systems::CacheIndex contact_results;
     systems::CacheIndex contact_surfaces;
     systems::CacheIndex generalized_accelerations;
     systems::CacheIndex generalized_contact_forces_continuous;
+    systems::CacheIndex hydro_fallback;
     systems::CacheIndex point_pairs;
     systems::CacheIndex spatial_contact_forces_continuous;
     systems::CacheIndex tamsi_solver_results;
@@ -3388,15 +3489,15 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   // Zplus_B, among other quantities needed by ABA.
   // N.B. Please refer to @ref internal_forward_dynamics for further details on
   // the algorithm and implementation.
-  void CalcArticulatedBodyForceBiasCache(
+  void CalcArticulatedBodyForceCache(
       const systems::Context<T>& context,
-      internal::ArticulatedBodyForceBiasCache<T>* aba_force_bias_cache) const;
+      internal::ArticulatedBodyForceCache<T>* aba_force_cache) const;
 
-  // Eval version of the method CalcArticulatedBodyForceBiasCache().
-  const internal::ArticulatedBodyForceBiasCache<T>&
-  EvalArticulatedBodyForceBiasCache(const systems::Context<T>& context) const {
-    return this->get_cache_entry(cache_indexes_.aba_force_bias_cache)
-        .template Eval<internal::ArticulatedBodyForceBiasCache<T>>(context);
+  // Eval version of the method CalcArticulatedBodyForceCache().
+  const internal::ArticulatedBodyForceCache<T>&
+  EvalArticulatedBodyForceCache(const systems::Context<T>& context) const {
+    return this->get_cache_entry(cache_indexes_.aba_force_cache)
+        .template Eval<internal::ArticulatedBodyForceCache<T>>(context);
   }
 
   // Implements the system dynamics according to this class's documentation.
@@ -3462,10 +3563,29 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   // Eval version of the method CalcContactSurfaces().
   const std::vector<geometry::ContactSurface<T>>& EvalContactSurfaces(
       const systems::Context<T>& context) const {
-    return this
-        ->get_cache_entry(cache_indexes_.contact_surfaces)
-        .template Eval<std::vector<geometry::ContactSurface<T>>>(context);
+    switch (contact_model_) {
+      case ContactModel::kHydroelasticWithFallback: {
+        const auto& data =
+            this->get_cache_entry(cache_indexes_.hydro_fallback)
+                .template Eval<internal::HydroelasticFallbackCacheData<T>>(
+                    context);
+        return data.contact_surfaces;
+      }
+      case ContactModel::kHydroelasticsOnly:
+        return this->get_cache_entry(cache_indexes_.contact_surfaces)
+            .template Eval<std::vector<geometry::ContactSurface<T>>>(context);
+      default:
+        throw std::logic_error(
+            "Attempting to evaluate contact surface for contact model that "
+            "doesn't use it");
+    }
   }
+
+  // Computes the hydroelastic fallback method -- all contacts are partitioned
+  // between ContactSurfaces and point pair contacts.
+  void CalcHydroelasticWithFallback(
+      const drake::systems::Context<T>& context,
+      internal::HydroelasticFallbackCacheData<T>* data) const;
 
   // Helper method to fill in the ContactResults given the current context when
   // the model is continuous.
@@ -3559,22 +3679,29 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
       const geometry::Shape& shape,
       const std::string& name);
 
+  // Registers a geometry frame for every body. If the body already has a
+  // geometry frame, it is unchanged. This registration is part of finalization.
+  // This requires RegisterAsSourceForSceneGraph() was called on `this` plant.
+  void RegisterGeometryFramesForAllBodies();
+
   bool body_has_registered_frame(const Body<T>& body) const {
     return body_index_to_frame_id_.find(body.index()) !=
         body_index_to_frame_id_.end();
   }
 
-  // Helper to retrieve a constant reference to the state vector from context.
-  const systems::BasicVector<T>& GetStateVector(
-      const systems::Context<T>& context) const;
+  // Registers the given body with this plant's SceneGraph instance (if it has
+  // one).
+  void RegisterRigidBodyWithSceneGraph(const Body<T>& body);
 
-  // Calc method for the continuous state vector output port.
-  void CopyContinuousStateOut(
+  // Calc method for the multibody state vector output port. It only copies the
+  // multibody state [q, v], ignoring any miscellaneous state z if present.
+  void CopyMultibodyStateOut(
       const systems::Context<T>& context, systems::BasicVector<T>* state) const;
 
-  // Calc method for the per-model-instance continuous state vector output
-  // port.
-  void CopyContinuousStateOut(
+  // Calc method for the per-model-instance multibody state vector output port.
+  // It only copies the per-model-instance multibody state [q, v], ignoring any
+  // miscellaneous state z if present.
+  void CopyMultibodyStateOut(
       ModelInstanceIndex model_instance,
       const systems::Context<T>& context, systems::BasicVector<T>* state) const;
 
@@ -3645,10 +3772,6 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
   void CalcAndAddContactForcesByPenaltyMethod(
       const systems::Context<T>& context,
       std::vector<SpatialForce<T>>* F_BBo_W_array) const;
-
-  // Helper to create the underlying hydroelastic fields used in the
-  // hydroelastic model.
-  void MakeHydroelasticModels();
 
   // Helper method to compute contact forces using the hydroelastic model.
   // F_BBo_W_array is indexed by BodyNodeIndex and it gets overwritten on
@@ -3996,62 +4119,60 @@ class MultibodyPlant : public internal::MultibodyTreeSystem<T> {
 template <typename T>
 struct AddMultibodyPlantSceneGraphResult;
 
-/// Adds a MultibodyPlant and a SceneGraph instance to a diagram builder,
+/// Makes a new MultibodyPlant with discrete update period `time_step` and
+/// adds it to a diagram builder together with the provided SceneGraph instance,
 /// connecting the geometry ports.
+/// @note Usage examples in @ref add_multibody_plant_scene_graph
+/// "AddMultibodyPlantSceneGraph".
+///
 /// @param[in,out] builder
 ///   Builder to add to.
-/// @param[in] plant (optional)
-///   Constructed plant (e.g. for using a discrete plant). By default, a
-///   continuous plant is used.
+/// @param[in] time_step
+///   The discrete update period for the new MultibodyPlant to be added.
+///   Please refer to the documentation provided in
+///   MultibodyPlant::MultibodyPlant(double) for further details on the
+///   parameter `time_step`.
 /// @param[in] scene_graph (optional)
 ///   Constructed scene graph. If none is provided, one will be created and
 ///   used.
 /// @return Pair of the registered plant and scene graph.
 /// @pre `builder` must be non-null.
-///
-/// Recommended usages:
-///
-/// Assign to a MultibodyPlant reference (ignoring the SceneGraph):
-/// @code
-///   MultibodyPlant<double>& plant = AddMultibodyPlantSceneGraph(&builder);
-///   plant.DoFoo(...);
-/// @endcode
-/// This flavor is the simplest, when the SceneGraph is not explicitly needed.
-/// (It can always be retrieved later via GetSubsystemByName("scene_graph").)
-///
-/// Assign to auto, and use the named public fields:
-/// @code
-///   auto items = AddMultibodyPlantSceneGraph(&builder);
-///   items.plant.DoFoo(...);
-///   items.scene_graph.DoBar(...);
-/// @endcode
-/// or
-/// @code
-///   auto items = AddMultibodyPlantSceneGraph(&builder);
-///   MultibodyPlant<double>& plant = items.plant;
-///   SceneGraph<double>& scene_graph = items.scene_graph;
-///   ...
-///   plant.DoFoo(...);
-///   scene_graph.DoBar(...);
-/// @endcode
-/// This is the easiest way to use both the plant and scene_graph.
-///
-/// Assign to already-declared pointer variables:
-/// @code
-///   MultibodyPlant<double>* plant{};
-///   SceneGraph<double>* scene_graph{};
-///   std::tie(plant, scene_graph) = AddMultibodyPlantSceneGraph(&builder);
-///   plant->DoFoo(...);
-///   scene_graph->DoBar(...);
-/// @endcode
-/// This flavor is most useful when the pointers are class member fields
-/// (and so perhaps cannot be references).
+/// @relates MultibodyPlant
 template <typename T>
 AddMultibodyPlantSceneGraphResult<T>
 AddMultibodyPlantSceneGraph(
     systems::DiagramBuilder<T>* builder,
-    std::unique_ptr<MultibodyPlant<T>> plant = nullptr,
+    double time_step,
     std::unique_ptr<geometry::SceneGraph<T>> scene_graph = nullptr);
+
+/// Adds a MultibodyPlant and a SceneGraph instance to a diagram
+/// builder, connecting the geometry ports.
+/// @note Usage examples in @ref add_multibody_plant_scene_graph
+/// "AddMultibodyPlantSceneGraph".
+///
+/// @param[in,out] builder
+///   Builder to add to.
+/// @param[in] plant
+///   Plant to be added to the builder.
+/// @param[in] scene_graph (optional)
+///   Constructed scene graph. If none is provided, one will be created and
+///   used.
+/// @return Pair of the registered plant and scene graph.
+/// @pre `builder` and `plant` must be non-null.
+/// @relates MultibodyPlant
+template <typename T>
+AddMultibodyPlantSceneGraphResult<T>
+AddMultibodyPlantSceneGraph(
+    systems::DiagramBuilder<T>* builder,
+    std::unique_ptr<MultibodyPlant<T>> plant,
+    std::unique_ptr<geometry::SceneGraph<T>> scene_graph = nullptr);
+
+/// Adds a new continuous MultibodyPlant to `builder`.
+template <typename T>
+DRAKE_DEPRECATED("2020-05-01", "Use alternative overloads explicitly providing a continuous or discrete MultibodyPlant modality. To retain the prior behavior of using a continuous-time plant, pass time_step = 0.0.")  // NOLINT(whitespace/line_length)
+AddMultibodyPlantSceneGraphResult<T>
+AddMultibodyPlantSceneGraph(
+    systems::DiagramBuilder<T>* builder);
 
 /// Temporary result from `AddMultibodyPlantSceneGraph`. This cannot be
 /// constructed outside of this method.
@@ -4069,6 +4190,20 @@ struct AddMultibodyPlantSceneGraphResult final {
   operator std::tuple<MultibodyPlant<T>*&, geometry::SceneGraph<T>*&>() {
     return std::tie(plant_ptr, scene_graph_ptr);
   }
+
+#ifndef DRAKE_DOXYGEN_CXX
+  // Returns the N-th member referenced by this struct.
+  // If N = 0, returns the reference to the MultibodyPlant.
+  // If N = 1, returns the reference to the geometry::SceneGraph.
+  // Provided to support C++17's structured binding.
+  template <std::size_t N>
+  decltype(auto) get() const {
+    if constexpr (N == 0)
+      return plant;
+    else if constexpr (N == 1)
+      return scene_graph;
+  }
+#endif
 
 #ifndef DRAKE_DOXYGEN_CXX
   // Only the move constructor is enabled; copy/assign/move-assign are deleted.
@@ -4112,8 +4247,6 @@ std::vector<geometry::PenetrationAsPointPair<AutoDiffXd>>
 MultibodyPlant<AutoDiffXd>::CalcPointPairPenetrations(
     const systems::Context<AutoDiffXd>&) const;
 template <>
-void MultibodyPlant<symbolic::Expression>::MakeHydroelasticModels();
-template <>
 void MultibodyPlant<symbolic::Expression>::CalcHydroelasticContactForces(
     const systems::Context<symbolic::Expression>&,
     HydroelasticContactInfoAndBodySpatialForces*) const;
@@ -4122,10 +4255,50 @@ void MultibodyPlant<symbolic::Expression>::
     CalcContactResultsContinuousHydroelastic(
         const systems::Context<symbolic::Expression>&,
         ContactResults<symbolic::Expression>*) const;
+template <>
+void MultibodyPlant<symbolic::Expression>::CalcContactSurfaces(
+    const systems::Context<symbolic::Expression>&,
+    std::vector<geometry::ContactSurface<symbolic::Expression>>*) const;
+template <>
+void MultibodyPlant<double>::CalcHydroelasticWithFallback(
+    const systems::Context<double>&,
+    internal::HydroelasticFallbackCacheData<double>*) const;
 #endif
 
 }  // namespace multibody
 }  // namespace drake
+
+#ifndef DRAKE_DOXYGEN_CXX
+// Specializations provided to support C++17's structured binding for
+// AddMultibodyPlantSceneGraphResult.
+namespace std {
+// The GCC standard library defines tuple_size as class and struct which
+// triggers a warning here.
+// We found this solution in: https://github.com/nlohmann/json/issues/1401
+#if defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-tags"
+#endif
+template <typename T>
+struct tuple_size<drake::multibody::AddMultibodyPlantSceneGraphResult<T>>
+    : std::integral_constant<std::size_t, 2> {};
+
+template <typename T>
+struct tuple_element<0,
+                     drake::multibody::AddMultibodyPlantSceneGraphResult<T>> {
+  using type = drake::multibody::MultibodyPlant<T>;
+};
+
+template <typename T>
+struct tuple_element<1,
+                     drake::multibody::AddMultibodyPlantSceneGraphResult<T>> {
+  using type = drake::geometry::SceneGraph<T>;
+};
+#if defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+}  // namespace std
+#endif
 
 DRAKE_DECLARE_CLASS_TEMPLATE_INSTANTIATIONS_ON_DEFAULT_SCALARS(
     class drake::multibody::MultibodyPlant)
